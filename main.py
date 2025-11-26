@@ -1,12 +1,14 @@
 import os
 import time
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 
 app = FastAPI()
+
+# --- ENVIRONMENT VARIABLES ---
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID_AI = os.environ["TELEGRAM_CHAT_ID_AI"]
@@ -15,10 +17,12 @@ CHAT_ID_DUMP = os.environ["TELEGRAM_CHAT_ID_DUMP"]
 CHAT_ID_TRADING = os.environ["TELEGRAM_CHAT_ID_TRADING"]
 
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
-COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "10"))  # защита от дубликатов
+COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "10"))  # защита от дубликатов сырых сигналов
 
-_last_by_key = {}  # кулдаун по сырым сигналам
-EPISODES = {}       # состояние по эпизодам AntiFOMO v1
+# --- GLOBAL STATE ---
+
+_last_by_key = {}   # кулдаун по сырым сигналам
+EPISODES = {}       # состояние по монетам/эпизодам AntiFOMO
 
 # TTL
 TTL_5M = 20 * 60      # 20 минут
@@ -29,11 +33,35 @@ CONFIRM_SIGNALS = {"A3", "A4", "A5", "A6", "A9", "A10", "A11", "A12"}
 MAXPOWER_SIGNALS = {"A9", "A10", "A11", "A12"}
 L_SIGNALS = {"A9L", "A10L", "A11L"}
 
+# --- TIME ZONE (MSK) ---
+
+MSK_TZ = timezone(timedelta(hours=3))
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _now_msk_str() -> str:
+    """Текущее время в МСК, для сообщений и таймштампов."""
+    return datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
+
+
+# --- HELPERS ---
 
 def escape_md(s: str) -> str:
-    """Эскейп для MarkdownV2."""
+    """Эскейп MarkdownV2."""
     for ch in r"_*[]()~`>#+-=|{}.!":
         s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def _fmt_price(p) -> str:
+    """Форматируем цену: до 8 знаков после запятой, без e-06 и хвостов нулей."""
+    if p is None:
+        return "—"
+    s = f"{p:.8f}"
+    s = s.rstrip("0").rstrip(".")
     return s
 
 
@@ -58,6 +86,7 @@ async def root():
 # -------------------------------------------
 # СТАРЫЙ /tv ДЛЯ БОЛЬШОЙ ВЕРСИИ (PUMP/DUMP)
 # -------------------------------------------
+
 @app.post("/tv")
 async def tv_webhook(request: Request):
     raw = await request.body()
@@ -85,13 +114,10 @@ async def tv_webhook(request: Request):
     ts = data.get("ts", "")
 
     key = f"{symbol}:{timeframe}:{side}:{signal_type}"
-    now = time.time()
+    now = _now()
     last = _last_by_key.get(key, 0)
     if now - last < COOLDOWN:
-        return {
-            "status": "cooldown_skip",
-            "left_seconds": COOLDOWN - int(now - last),
-        }
+        return {"status": "cooldown_skip", "left_seconds": COOLDOWN - int(now - last)}
     _last_by_key[key] = now
 
     tps_str = ", ".join(map(str, tps)) if tps else "—"
@@ -104,12 +130,8 @@ async def tv_webhook(request: Request):
     lines.append(
         f"*{escape_md(symbol)}* • `{escape_md(timeframe)}` — *{escape_md(side)}* `{escape_md(liq)}`"
     )
-    lines.append(
-        f"Entry: `{escape_md(str(entry))}`   SL: `{escape_md(str(sl))}`"
-    )
-    lines.append(
-        f"TPs: `{escape_md(tps_str)}`   Conf: `{escape_md(conf_str)}`"
-    )
+    lines.append(f"Entry: `{escape_md(str(entry))}`   SL: `{escape_md(str(sl))}`")
+    lines.append(f"TPs: `{escape_md(tps_str)}`   Conf: `{escape_md(str(conf_str))}`")
     lines.append(
         f"BTC\\-Guard: `{escape_md(str(btc_guard))}`   VolFade: `{escape_md(str(volume_fade))}`"
     )
@@ -118,7 +140,6 @@ async def tv_webhook(request: Request):
         lines.append(f"`{escape_md(str(ts))}`")
 
     text = "\n".join(lines)
-
     if signal_type == "PUMP":
         target_chat = CHAT_ID_PUMP
     elif signal_type == "DUMP":
@@ -131,12 +152,8 @@ async def tv_webhook(request: Request):
 
 
 # -------------------------------------------
-# ФУНКЦИИ ДЛЯ АГРЕГАТОРА AntiFOMO v1
+# ФУНКЦИИ ДЛЯ АГРЕГАТОРА AntiFOMO v0.9
 # -------------------------------------------
-
-def _now() -> float:
-    return time.time()
-
 
 def _get_episode(symbol: str) -> dict:
     ep = EPISODES.get(symbol)
@@ -145,7 +162,9 @@ def _get_episode(symbol: str) -> dict:
             "state": "IDLE",  # IDLE / CORE / SETUP / CANCELLED / FLIPPED
             "signals": {},    # name -> {active, ts_str, server_ts, timeframe}
             "high_pump": None,
+            "high_pump_ts": None,
             "low_after_pump": None,
+            "low_after_pump_ts": None,
             "setup_ts": None,
             "last_upgrade_ts": None,
             "last_retest_ts": None,
@@ -165,17 +184,18 @@ def _update_ttl(ep: dict, now_ts: float):
             if age > TTL_5M:
                 info["active"] = False
         else:
-            # считаем всё остальное как 1H-контекст
             if age > TTL_1H:
                 info["active"] = False
 
 
-def _set_signal(ep: dict, name: str, ts_str: str, timeframe: str):
+def _set_signal(ep: dict, name: str, timeframe: str):
+    """Фиксируем сигнал как активный, с временем в МСК."""
     ep["signals"].setdefault(name, {})
-    ep["signals"][name]["active"] = True
-    ep["signals"][name]["ts_str"] = ts_str
-    ep["signals"][name]["server_ts"] = _now()
-    ep["signals"][name]["timeframe"] = timeframe
+    info = ep["signals"][name]
+    info["active"] = True
+    info["ts_str"] = _now_msk_str()
+    info["server_ts"] = _now()
+    info["timeframe"] = timeframe
 
 
 def _signal_active(ep: dict, name: str) -> bool:
@@ -214,6 +234,7 @@ def _btc_guard_ok(btc_corr: float, btc_trend: str) -> (bool, str):
 def _format_signals_block(ep: dict) -> str:
     """Блок с галочками и временем для A1–A12 и L-сигналов."""
     lines = []
+
     def line(name: str, desc: str):
         info = ep["signals"].get(name, {})
         active = info.get("active", False)
@@ -242,7 +263,7 @@ def _format_signals_block(ep: dict) -> str:
     line("A11", "CRSI 80 DOWN (мощный разворот)")
     line("A12", "Volume Exhaustion 1H")
 
-    # L-сигналы
+    # L-signals
     line("A9L", "SuperTrend 1H UP (L)")
     line("A10L", "CRSI 80 DOWN (L)")
     line("A11L", "CRSI 20 UP (L)")
@@ -251,7 +272,7 @@ def _format_signals_block(ep: dict) -> str:
 
 
 def _calc_retest(ep: dict, close_price: float) -> bool:
-    """Проверка ретеста (возврат >50% высоты пампа)."""
+    """Простейшая проверка ретеста: возврат цены выше 50% диапазона пампа."""
     high_pump = ep.get("high_pump")
     low_after = ep.get("low_after_pump")
     if high_pump is None or low_after is None:
@@ -259,12 +280,11 @@ def _calc_retest(ep: dict, close_price: float) -> bool:
     if high_pump <= low_after:
         return False
     level_50 = low_after + (high_pump - low_after) * 0.5
-    return close_price >= level_50
+    return close_price is not None and close_price >= level_50
 
 
 async def _send_setup(symbol: str, ep: dict, btc_corr: float, btc_trend: str):
-    now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    setup_ts_str = now_ts
+    setup_ts_str = _now_msk_str()
     ep["setup_ts"] = _now()
 
     btc_ok, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
@@ -277,18 +297,16 @@ async def _send_setup(symbol: str, ep: dict, btc_corr: float, btc_trend: str):
     lines.append(f"{escape_md('Время SETUP')}: `{escape_md(setup_ts_str)}`")
     lines.append("")
     lines.append(f"{escape_md('Core')}:")
-    lines.append(signals_block.split("\n")[0])  # A1
-    lines.append(signals_block.split("\n")[1])  # A2
+    # A1, A2 — первые две строки
+    sb_lines = signals_block.split("\n")
+    if len(sb_lines) >= 2:
+        lines.append(sb_lines[0])
+        lines.append(sb_lines[1])
     lines.append("")
     lines.append(f"{escape_md('Confirm / сила сетапа')}: {strength}/8")
-    lines.append(signals_block.split("\n")[2])  # A3
-    lines.append(signals_block.split("\n")[3])  # A4
-    lines.append(signals_block.split("\n")[4])  # A5
-    lines.append(signals_block.split("\n")[5])  # A6
-    lines.append(signals_block.split("\n")[6])  # A9
-    lines.append(signals_block.split("\n")[7])  # A10
-    lines.append(signals_block.split("\n")[8])  # A11
-    lines.append(signals_block.split("\n")[9])  # A12
+    # A3–A12
+    for i in range(2, min(len(sb_lines), 10)):
+        lines.append(sb_lines[i])
     lines.append("")
     lines.append(f"{escape_md('BTC-Guard')}: {escape_md(btc_comment)}")
 
@@ -299,11 +317,11 @@ async def _send_setup(symbol: str, ep: dict, btc_corr: float, btc_trend: str):
 
 
 async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: int):
-    now_ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    now_ts_str = _now_msk_str()
     setup_time = ep.get("setup_ts")
     setup_ts_str = ""
     if setup_time:
-        setup_ts_str = datetime.fromtimestamp(setup_time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        setup_ts_str = datetime.fromtimestamp(setup_time, tz=MSK_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
 
     signals_block = _format_signals_block(ep)
 
@@ -325,7 +343,8 @@ async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: 
 
 
 async def _send_retest(symbol: str, ep: dict, close_price: float):
-    now_ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    """Отправляем аккуратное RETEST-сообщение без спама."""
+    now_ts_str = _now_msk_str()
     high_pump = ep.get("high_pump")
     low_after = ep.get("low_after_pump")
 
@@ -335,21 +354,18 @@ async def _send_retest(symbol: str, ep: dict, close_price: float):
     lines.append(f"{escape_md('Время ретеста')}: `{escape_md(now_ts_str)}`")
     lines.append("")
     lines.append(f"{escape_md('Памп')}:")
-    lines.append(f"{escape_md('High пампа')}: `{escape_md(str(high_pump))}`")
-    lines.append(f"{escape_md('Low отката')}: `{escape_md(str(low_after))}`")
-    lines.append(f"{escape_md('Цена ретеста')}: `{escape_md(str(close_price))}`")
+    lines.append(f"{escape_md('High пампа')}: `{escape_md(_fmt_price(high_pump))}`")
+    lines.append(f"{escape_md('Low отката')}: `{escape_md(_fmt_price(low_after))}`")
+    lines.append(f"{escape_md('Цена ретеста')}: `{escape_md(_fmt_price(close_price))}`")
     lines.append("")
     lines.append(escape_md("Статус: шортовый сценарий под угрозой."))
 
     text = "\n".join(lines)
     await send_telegram(CHAT_ID_TRADING, text)
-    ep["last_retest_ts"] = _now()
 
 
 async def _send_flip(symbol: str, ep: dict):
-    now_ts_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    signals_block = _format_signals_block(ep)
-
+    now_ts_str = _now_msk_str()
     lines = []
     lines.append(f"*{escape_md('[FLIP → LONG] TREND REVERSAL')}*")
     lines.append(f"{escape_md('Пара')}: *{escape_md(symbol)}*")
@@ -374,73 +390,74 @@ async def _send_flip(symbol: str, ep: dict):
     ep["state"] = "FLIPPED"
 
 
-async def process_signal_v0(symbol: str,
-                            timeframe: str,
-                            signal: str,
-                            side: str,
-                            ts_str: str,
-                            close_price: float,
-                            high_price: float,
-                            low_price: float,
-                            btc_corr,
-                            btc_trend):
+async def process_signal_v0(
+    symbol: str,
+    timeframe: str,
+    signal: str,
+    side: str,
+    ts_str: str,
+    close_price: float,
+    high_price: float,
+    low_price: float,
+    btc_corr,
+    btc_trend,
+):
     """
-    Основной агрегатор AntiFOMO v1.
+    Основной агрегатор AntiFOMO v0.9:
+    - обновляет сигналы
+    - ведёт TTL
+    - считает core/confirm/maxpower
+    - шлёт SETUP/UPGRADE/RETEST/FLIP
+    (пока без многоступенчатого ретест-движка, это будет v1.0)
     """
     now_ts = _now()
     ep = _get_episode(symbol)
 
-    # Обновляем TTL
+    # TTL
     _update_ttl(ep, now_ts)
 
     # Обновляем сигнал
-    _set_signal(ep, signal, ts_str, timeframe)
+    _set_signal(ep, signal, timeframe)
 
-    # Обновляем high_pump / low_after_pump (для ретеста)
-    if signal == "A1" or signal == "A2":
-        # фиксируем максимум пампа
+    # Обновляем high_pump / low_after_pump (для простого ретеста)
+    if signal in ("A1", "A2"):
         if high_price is not None:
             if ep["high_pump"] is None or high_price > ep["high_pump"]:
                 ep["high_pump"] = high_price
+                ep["high_pump_ts"] = _now_msk_str()
 
-    # минимальный low_after_pump: после пампа, когда цена уходит вниз
     if _signal_active(ep, "A1") and _signal_active(ep, "A2"):
         if low_price is not None:
             if ep["low_after_pump"] is None or low_price < ep["low_after_pump"]:
                 ep["low_after_pump"] = low_price
+                ep["low_after_pump_ts"] = _now_msk_str()
 
-    # Проверка RETEST
-    if ep["high_pump"] is not None and ep["low_after_pump"] is not None and close_price is not None:
-        if _calc_retest(ep, close_price):
-            # RETEST
+    # Простейший RETEST с антиспамом
+    if close_price is not None and _calc_retest(ep, close_price):
+        last_rt = ep.get("last_retest_ts")
+        # Например, не чаще одного RETEST-сообщения в 5 минут
+        if not last_rt or now_ts - last_rt > 300:
             await _send_retest(symbol, ep, close_price)
-            # не сразу FLIP, ждём L-сигналы
-            # но уже можем считать шорт-сценарий проблемным
-            # (в дальнейшей логике можно блокировать новый SETUP до FLIP/нового эпизода)
+            ep["last_retest_ts"] = now_ts
 
-    # Эпизод: проверяем Core
-    has_core = _signal_active(ep, "A1") and _signal_active(ep, "A2")
-
-    # Считаем Confirm / MaxPower / L-signals
-    confirms = _count_confirms(ep)
-    has_maxpower = _has_maxpower(ep)
+    # L-сигналы → FLIP (просто если ≥2 L-активных сигналов)
     l_count = _count_l_signals(ep)
-
-    # FLIP → LONG (2+ L-сигнала)
     if l_count >= 2 and ep["state"] != "FLIPPED":
         await _send_flip(symbol, ep)
         return
 
-    # Если нет ядра или нет MaxPower — сетап невозможен
-    if not has_core or not has_maxpower:
-        # только обновляем состояние, но SETUP не шлём
-        return
+    # Эпизод: проверяем Core
+    has_core = _signal_active(ep, "A1") and _signal_active(ep, "A2")
+
+    # Считаем Confirm / MaxPower
+    confirms = _count_confirms(ep)
+    has_maxpower = _has_maxpower(ep)
 
     # BTC-Guard
-    btc_ok, _ = _btc_guard_ok(btc_corr, btc_trend)
+    btc_ok, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
 
-    # Если BTC-Guard блокирует — SETUP не даём
-    if not btc_ok:
+    # Если нет ядра или нет MaxPower или BTC блокирует → SETUP невозможен
+    if not has_core or not has_maxpower or not btc_ok:
         return
 
     # Генерация SETUP
@@ -450,20 +467,16 @@ async def process_signal_v0(symbol: str,
 
     # UPGRADE
     if ep["state"] == "SETUP":
-        old_strength = _count_confirms(ep)  # до этого шага, но мы уже обновили сигнал...
-        # небольшой трюк: мы можем хранить strength в эпизоде, но для простоты
-        # будем считать, что если пришёл новый CONFIRM сигнал, strength увеличился,
-        # и мы шлём UPGRADE один раз
-        # (под v2 можно сделать аккуратный учёт)
+        old_strength = _count_confirms(ep)  # до новой точки зрения можно хранить отдельно
         new_strength = _count_confirms(ep)
-        # если новый CONFIRM действительно увеличил силу, и это не просто повтор
         if new_strength > old_strength:
             await _send_upgrade(symbol, ep, old_strength, new_strength)
 
 
 # -------------------------------------------
-# НОВЫЙ /tv_v0 ДЛЯ УПРОЩЁННОЙ ANTI-FOMO v1
+# НОВЫЙ /tv_v0 ДЛЯ УПРОЩЁННОЙ ANTI-FOMO v0.9
 # -------------------------------------------
+
 @app.post("/tv_v0")
 async def tv_webhook_v0(request: Request):
     raw = await request.body()
@@ -482,7 +495,7 @@ async def tv_webhook_v0(request: Request):
     side = str(data.get("side", "?")).upper()
     ts_str = str(data.get("ts") or data.get("time") or "")
 
-    # цены
+    # Парсим цены
     def _num(x):
         try:
             return float(x)
@@ -493,23 +506,31 @@ async def tv_webhook_v0(request: Request):
     high_price = _num(data.get("high"))
     low_price = _num(data.get("low"))
 
-    # BTC корреляция/тренд (пока как есть, можно позже привязать к отдельному сигналу)
+    # BTC контекст (пока в режиме v0.9, можно заполнять позже)
     btc_corr = data.get("btc_corr", 0.0)
     btc_trend = data.get("btc_trend", "UNKNOWN")
 
-    # Кулдаун на уровне сырых сигналов (защита от дубликатов от TV)
+    # Кулдаун на уровне сырых сигналов
     key = f"v0:{symbol}:{timeframe}:{side}:{signal}"
-    now = time.time()
+    now = _now()
     last = _last_by_key.get(key, 0)
     if now - last < COOLDOWN:
-        return {
-            "status": "cooldown_skip",
-            "left_seconds": COOLDOWN - int(now - last),
-        }
+        return {"status": "cooldown_skip", "left_seconds": COOLDOWN - int(now - last)}
     _last_by_key[key] = now
 
-    # Запускаем агрегатор
-    await process_signal_v0(symbol, timeframe, signal, side, ts_str, close_price, high_price, low_price, btc_corr, btc_trend)
+    # Обработка сигнала агрегатором
+    await process_signal_v0(
+        symbol=symbol,
+        timeframe=timeframe,
+        signal=signal,
+        side=side,
+        ts_str=ts_str,
+        close_price=close_price,
+        high_price=high_price,
+        low_price=low_price,
+        btc_corr=btc_corr,
+        btc_trend=btc_trend,
+    )
 
-    # Для отладки можно вернуть state по монете
+    # Для отладки можно возвращать symbol/signal
     return {"status": "ok", "symbol": symbol, "signal": signal}
