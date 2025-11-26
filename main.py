@@ -21,7 +21,7 @@ COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "10"))
 
 # === GLOBAL STATE ===
 
-_last_by_key = {}       # raw webhook cooldown
+_last_by_key = {}       # cooldown for raw alerts
 EPISODES = {}           # per-symbol state
 
 TTL_5M = 20 * 60
@@ -45,13 +45,14 @@ def _now_msk_str() -> str:
 # === HELPERS ===
 
 def _fmt_price(p) -> str:
+    """Format price as plain decimal string."""
     if p is None:
         return "—"
     s = f"{p:.8f}".rstrip("0").rstrip(".")
     return s
 
 async def send_telegram(chat_id: str, text: str, disable_preview: bool = True):
-    """Send plain text (no Markdown)."""
+    """Send plain text message to Telegram (no Markdown)."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
@@ -75,7 +76,7 @@ async def tv_webhook(request: Request):
     raw = await request.body()
     try:
         data = json.loads(raw.decode("utf-8"))
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Bad JSON")
 
     if data.get("secret") != WEBHOOK_SECRET:
@@ -97,17 +98,18 @@ async def tv_webhook(request: Request):
     ts = data.get("ts", "")
 
     key = f"{symbol}:{timeframe}:{side}:{signal_type}"
-    now = _now()
-    if now - _last_by_key.get(key, 0) < COOLDOWN:
+    now_ts = _now()
+    if now_ts - _last_by_key.get(key, 0) < COOLDOWN:
         return {"status": "cooldown_skip"}
-    _last_by_key[key] = now
+    _last_by_key[key] = now_ts
+
+    tps_str = ", ".join(map(str, tps)) if tps else "—"
 
     lines = []
     lines.append(f"AntiFOMO {signal_type} Signal")
     lines.append(f"Пара: {symbol}")
     lines.append(f"TF: {timeframe}   SIDE: {side}   LIQ: {liq}")
     lines.append(f"Entry: {entry}   SL: {sl}")
-    tps_str = ", ".join(map(str, tps)) if tps else "—"
     lines.append(f"TPs: {tps_str}   Conf: {conf}")
     lines.append(f"BTC-Guard: {btc_guard}   VolFade: {volume_fade}")
     if ts:
@@ -126,8 +128,8 @@ def _get_episode(symbol: str) -> dict:
     ep = EPISODES.get(symbol)
     if ep is None:
         ep = {
-            "state": "IDLE",
-            "signals": {},
+            "state": "IDLE",  # IDLE / SETUP / FLIPPED
+            "signals": {},    # name -> {active, ts_str, server_ts, timeframe}
             "high_pump": None,
             "high_pump_ts": None,
             "low_after_pump": None,
@@ -140,6 +142,7 @@ def _get_episode(symbol: str) -> dict:
     return ep
 
 def _update_ttl(ep: dict, now_ts: float):
+    """Disable expired signals by TTL."""
     for name, info in ep["signals"].items():
         if not info.get("active", False):
             continue
@@ -174,7 +177,7 @@ def _count_l_signals(ep: dict) -> int:
 def _btc_guard_ok(btc_corr, btc_trend):
     try:
         corr = float(btc_corr)
-    except:
+    except Exception:
         corr = 0.0
     trend = str(btc_trend).upper()
 
@@ -183,15 +186,18 @@ def _btc_guard_ok(btc_corr, btc_trend):
     return True, f"Корреляция: {corr:.2f}, BTC: {trend}"
 
 def _format_signals_block(ep: dict) -> str:
+    """Return multiline description of signals."""
     lines = []
+
     def add(name, desc):
         info = ep["signals"].get(name, {})
         mark = "✓" if info.get("active", False) else "✗"
-        ts = info.get("ts_str", "")
-        if ts:
-            lines.append(f"{name} – {desc}: {mark} ({ts})")
+        tss = info.get("ts_str", "")
+        if tss:
+            lines.append(f"{name} – {desc}: {mark} ({tss})")
         else:
             lines.append(f"{name} – {desc}: {mark}")
+
     add("A1", "Памп (MicroPump)")
     add("A2", "Перегрев EMA (Overextension)")
     add("A3", "Volume Spike")
@@ -205,9 +211,11 @@ def _format_signals_block(ep: dict) -> str:
     add("A9L", "SuperTrend 1H UP (L)")
     add("A10L", "CRSI 80 DOWN (L)")
     add("A11L", "CRSI 20 UP (L)")
+
     return "\n".join(lines)
 
 def _calc_retest(ep: dict, close_price: float) -> bool:
+    """Simple retest: return price back above 50% of pump range."""
     high_pump = ep.get("high_pump")
     low_after = ep.get("low_after_pump")
     if high_pump is None or low_after is None:
@@ -217,7 +225,7 @@ def _calc_retest(ep: dict, close_price: float) -> bool:
     level50 = low_after + (high_pump - low_after) * 0.5
     return close_price is not None and close_price >= level50
 
-# === SENDERS ===================================================================
+# === SENDERS ===============================================================
 
 async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend):
     ts = _now_msk_str()
@@ -225,7 +233,8 @@ async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend):
 
     _, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
     strength = _count_confirms(ep)
-    signals_block = _format_signals_block(ep)
+    block = _format_signals_block(ep)
+    block_lines = block.split("\n")
 
     lines = []
     lines.append("[SETUP READY] ANTI-FOMO SHORT")
@@ -233,11 +242,11 @@ async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend):
     lines.append(f"Время SETUP: {ts}")
     lines.append("")
     lines.append("Core (A1, A2):")
-    for l in signals_block.split("\n")[:2]:
+    for l in block_lines[:2]:
         lines.append(l)
     lines.append("")
     lines.append(f"Confirm сигналы: {strength}/8")
-    for l in signals_block.split("\n")[2:10]:
+    for l in block_lines[2:10]:
         lines.append(l)
     lines.append("")
     lines.append(f"BTC-Guard: {btc_comment}")
@@ -248,20 +257,18 @@ async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend):
 async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: int):
     ts = _now_msk_str()
     setup_ts = ep.get("setup_ts")
-    setup_ts_str = ""
+    setup_str = ""
     if setup_ts:
-        setup_ts_str = datetime.fromtimestamp(setup_ts, MSK_TZ).strftime(
-            "%Y-%m-%d %H:%M:%S MSK"
-        )
+        setup_str = datetime.fromtimestamp(setup_ts, MSK_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
 
     lines = []
     lines.append("[UPGRADE] SHORT SETUP STRENGTHENED")
     lines.append(f"Пара: {symbol}")
     lines.append(f"Время UPGRADE: {ts}")
-    if setup_ts_str:
-        lines.append(f"Время SETUP: {setup_ts_str}")
+    if setup_str:
+        lines.append(f"Время SETUP: {setup_str}")
     lines.append("")
-    lines.append(f"Сила сетапа: было {old_strength}/8 → стало {new_strength}/8")
+    lines.append(f"Сила сетапа: было {old_strength}/8 -> стало {new_strength}/8")
     lines.append("")
     lines.append("Сигналы:")
     lines.append(_format_signals_block(ep))
@@ -292,7 +299,7 @@ async def _send_flip(symbol: str, ep: dict):
     ts = _now_msk_str()
 
     lines = []
-    lines.append("[FLIP → LONG] TREND REVERSAL")
+    lines.append("[FLIP -> LONG] TREND REVERSAL")
     lines.append(f"Пара: {symbol}")
     lines.append(f"Время Flip: {ts}")
     lines.append("")
@@ -311,7 +318,7 @@ async def _send_flip(symbol: str, ep: dict):
     await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
     ep["state"] = "FLIPPED"
 
-# ===============================================================================
+# === MAIN AGGREGATOR =======================================================
 
 async def process_signal_v0(
     symbol: str,
@@ -331,6 +338,7 @@ async def process_signal_v0(
     _update_ttl(ep, now_ts)
     _set_signal(ep, signal, timeframe)
 
+    # Update pump levels
     if signal in ("A1", "A2"):
         if high_price is not None:
             if ep["high_pump"] is None or high_price > ep["high_pump"]:
@@ -343,26 +351,28 @@ async def process_signal_v0(
                 ep["low_after_pump"] = low_price
                 ep["low_after_pump_ts"] = _now_msk_str()
 
+    # Simple RETEST with anti-spam (not more often than every 5 minutes)
     if close_price is not None and _calc_retest(ep, close_price):
         last_rt = ep.get("last_retest_ts")
         if not last_rt or now_ts - last_rt > 300:
             await _send_retest(symbol, ep, close_price)
             ep["last_retest_ts"] = now_ts
 
+    # FLIP logic (>=2 L-signals)
     if _count_l_signals(ep) >= 2 and ep["state"] != "FLIPPED":
         await _send_flip(symbol, ep)
         return
 
+    # SETUP requirements
     has_core = _signal_active(ep, "A1") and _signal_active(ep, "A2")
     confirms = _count_confirms(ep)
     has_maxpower = _has_maxpower(ep)
-
     btc_ok, _ = _btc_guard_ok(btc_corr, btc_trend)
 
     if not has_core or not has_maxpower or not btc_ok:
         return
 
-    if ep["state"] in ("IDLE", "CORE") and confirms >= 3:
+    if ep["state"] in ("IDLE",) and confirms >= 3:
         await _send_setup(symbol, ep, btc_corr, btc_trend)
         return
 
@@ -381,7 +391,7 @@ async def tv_webhook_v0(request: Request):
     raw = await request.body()
     try:
         data = json.loads(raw.decode("utf-8"))
-    except:
+    except Exception:
         raise HTTPException(status_code=400, detail="Bad JSON")
 
     if data.get("secret") != WEBHOOK_SECRET:
@@ -396,7 +406,7 @@ async def tv_webhook_v0(request: Request):
     def _num(x):
         try:
             return float(x)
-        except:
+        except Exception:
             return None
 
     close_price = _num(data.get("close"))
@@ -407,10 +417,10 @@ async def tv_webhook_v0(request: Request):
     btc_trend = data.get("btc_trend", "UNKNOWN")
 
     key = f"v0:{symbol}:{timeframe}:{side}:{signal}"
-    now = _now()
-    if now - _last_by_key.get(key, 0) < COOLDOWN:
+    now_ts = _now()
+    if now_ts - _last_by_key.get(key, 0) < COOLDOWN:
         return {"status": "cooldown_skip"}
-    _last_by_key[key] = now
+    _last_by_key[key] = now_ts
 
     await process_signal_v0(
         symbol=symbol,
@@ -418,3 +428,11 @@ async def tv_webhook_v0(request: Request):
         signal=signal,
         side=side,
         ts_str=ts_str,
+        close_price=close_price,
+        high_price=high_price,
+        low_price=low_price,
+        btc_corr=btc_corr,
+        btc_trend=btc_trend,
+    )
+
+    return {"status": "ok", "symbol": symbol, "signal": signal}
