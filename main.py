@@ -36,20 +36,24 @@ L_SIGNALS = {"A9L", "A10L", "A11L"}
 
 MSK_TZ = timezone(timedelta(hours=3))
 
+
 def _now() -> float:
     return time.time()
+
 
 def _now_msk_str() -> str:
     return datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
 
+
 # === HELPERS ===
 
 def _fmt_price(p) -> str:
-    """Format price as plain decimal string."""
+    """Format price as plain decimal string (up to 8 decimals)."""
     if p is None:
         return "—"
     s = f"{p:.8f}".rstrip("0").rstrip(".")
     return s
+
 
 async def send_telegram(chat_id: str, text: str, disable_preview: bool = True):
     """Send plain text message to Telegram (no Markdown)."""
@@ -63,9 +67,11 @@ async def send_telegram(chat_id: str, text: str, disable_preview: bool = True):
         r = await client.post(url, json=payload)
         r.raise_for_status()
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "AntiFOMO webhook running"}
+
 
 # =========================================================
 #           LEGACY PUMP/DUMP ENDPOINT  /tv
@@ -120,8 +126,9 @@ async def tv_webhook(request: Request):
     await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
     return {"status": "ok"}
 
+
 # =========================================================
-#            ANTI-FOMO v0.9 AGGREGATOR
+#            ANTI-FOMO v0.9.2 AGGREGATOR
 # =========================================================
 
 def _get_episode(symbol: str) -> dict:
@@ -129,7 +136,7 @@ def _get_episode(symbol: str) -> dict:
     if ep is None:
         ep = {
             "state": "IDLE",  # IDLE / SETUP / FLIPPED
-            "signals": {},    # name -> {active, ts_str, server_ts, timeframe}
+            "signals": {},    # name -> {active, ts_str, server_ts, timeframe, price}
             "high_pump": None,
             "high_pump_ts": None,
             "low_after_pump": None,
@@ -137,9 +144,11 @@ def _get_episode(symbol: str) -> dict:
             "setup_ts": None,
             "last_upgrade_ts": None,
             "last_retest_ts": None,
+            "last_strength": 0,
         }
         EPISODES[symbol] = ep
     return ep
+
 
 def _update_ttl(ep: dict, now_ts: float):
     """Disable expired signals by TTL."""
@@ -155,24 +164,32 @@ def _update_ttl(ep: dict, now_ts: float):
             if age > TTL_1H:
                 info["active"] = False
 
-def _set_signal(ep: dict, name: str, timeframe: str):
+
+def _set_signal(ep: dict, name: str, timeframe: str, price: float):
     ep["signals"].setdefault(name, {})
-    ep["signals"][name]["active"] = True
-    ep["signals"][name]["ts_str"] = _now_msk_str()
-    ep["signals"][name]["server_ts"] = _now()
-    ep["signals"][name]["timeframe"] = timeframe
+    info = ep["signals"][name]
+    info["active"] = True
+    info["ts_str"] = _now_msk_str()
+    info["server_ts"] = _now()
+    info["timeframe"] = timeframe
+    info["price"] = price
+
 
 def _signal_active(ep: dict, name: str) -> bool:
     return ep["signals"].get(name, {}).get("active", False)
 
+
 def _count_confirms(ep: dict) -> int:
     return sum(_signal_active(ep, s) for s in CONFIRM_SIGNALS)
+
 
 def _has_maxpower(ep: dict) -> bool:
     return any(_signal_active(ep, s) for s in MAXPOWER_SIGNALS)
 
+
 def _count_l_signals(ep: dict) -> int:
     return sum(_signal_active(ep, s) for s in L_SIGNALS)
+
 
 def _btc_guard_ok(btc_corr, btc_trend):
     try:
@@ -185,15 +202,20 @@ def _btc_guard_ok(btc_corr, btc_trend):
         return False, f"Корреляция: {corr:.2f}, BTC: UP — BLOCK"
     return True, f"Корреляция: {corr:.2f}, BTC: {trend}"
 
+
 def _format_signals_block(ep: dict) -> str:
-    """Return multiline description of signals."""
+    """Return multiline description of signals with time and price."""
     lines = []
 
     def add(name, desc):
         info = ep["signals"].get(name, {})
         mark = "✓" if info.get("active", False) else "✗"
         tss = info.get("ts_str", "")
-        if tss:
+        price = info.get("price", None)
+        price_str = _fmt_price(price)
+        if tss and price is not None:
+            lines.append(f"{name} – {desc}: {mark} ({tss}, цена: {price_str})")
+        elif tss:
             lines.append(f"{name} – {desc}: {mark} ({tss})")
         else:
             lines.append(f"{name} – {desc}: {mark}")
@@ -208,11 +230,13 @@ def _format_signals_block(ep: dict) -> str:
     add("A10", "CRSI 20 UP")
     add("A11", "CRSI 80 DOWN")
     add("A12", "Volume Exhaustion 1H")
+
     add("A9L", "SuperTrend 1H UP (L)")
     add("A10L", "CRSI 80 DOWN (L)")
     add("A11L", "CRSI 20 UP (L)")
 
     return "\n".join(lines)
+
 
 def _calc_retest(ep: dict, close_price: float) -> bool:
     """Simple retest: return price back above 50% of pump range."""
@@ -225,9 +249,10 @@ def _calc_retest(ep: dict, close_price: float) -> bool:
     level50 = low_after + (high_pump - low_after) * 0.5
     return close_price is not None and close_price >= level50
 
-# === SENDERS ===============================================================
 
-async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend):
+# === SENDERS ==============================================================
+
+async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend, setup_price: float):
     ts = _now_msk_str()
     ep["setup_ts"] = _now()
 
@@ -240,6 +265,7 @@ async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend):
     lines.append("[SETUP READY] ANTI-FOMO SHORT")
     lines.append(f"Пара: {symbol}")
     lines.append(f"Время SETUP: {ts}")
+    lines.append(f"Цена SETUP: {_fmt_price(setup_price)}")
     lines.append("")
     lines.append("Core (A1, A2):")
     for l in block_lines[:2]:
@@ -253,8 +279,10 @@ async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend):
 
     await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
     ep["state"] = "SETUP"
+    ep["last_strength"] = strength
 
-async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: int):
+
+async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: int, upgrade_price: float):
     ts = _now_msk_str()
     setup_ts = ep.get("setup_ts")
     setup_str = ""
@@ -267,6 +295,7 @@ async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: 
     lines.append(f"Время UPGRADE: {ts}")
     if setup_str:
         lines.append(f"Время SETUP: {setup_str}")
+    lines.append(f"Цена UPGRADE: {_fmt_price(upgrade_price)}")
     lines.append("")
     lines.append(f"Сила сетапа: было {old_strength}/8 -> стало {new_strength}/8")
     lines.append("")
@@ -275,6 +304,8 @@ async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: 
 
     await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
     ep["last_upgrade_ts"] = _now()
+    ep["last_strength"] = new_strength
+
 
 async def _send_retest(symbol: str, ep: dict, close_price: float):
     ts = _now_msk_str()
@@ -287,28 +318,37 @@ async def _send_retest(symbol: str, ep: dict, close_price: float):
     lines.append(f"Время ретеста: {ts}")
     lines.append("")
     lines.append("Памп:")
-    lines.append(f"High пампа: { _fmt_price(hp) }")
-    lines.append(f"Low отката: { _fmt_price(lp) }")
-    lines.append(f"Цена ретеста: { _fmt_price(close_price) }")
+    lines.append(f"High пампа: {_fmt_price(hp)}")
+    lines.append(f"Low отката: {_fmt_price(lp)}")
+    lines.append(f"Цена ретеста: {_fmt_price(close_price)}")
     lines.append("")
     lines.append("Статус: шортовый сценарий под угрозой.")
 
     await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
 
-async def _send_flip(symbol: str, ep: dict):
+
+async def _send_flip(symbol: str, ep: dict, flip_price: float, btc_corr, btc_trend):
     ts = _now_msk_str()
+    _, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
 
     lines = []
     lines.append("[FLIP -> LONG] TREND REVERSAL")
     lines.append(f"Пара: {symbol}")
     lines.append(f"Время Flip: {ts}")
+    lines.append(f"Цена Flip: {_fmt_price(flip_price)}")
+    lines.append("")
+    lines.append(f"BTC-Guard: {btc_comment}")
     lines.append("")
     lines.append("L-сигналы:")
     for name in ("A9L", "A10L", "A11L"):
         info = ep["signals"].get(name, {})
         mark = "✓" if info.get("active", False) else "✗"
         tss = info.get("ts_str", "")
-        if tss:
+        price = info.get("price", None)
+        price_str = _fmt_price(price)
+        if tss and price is not None:
+            lines.append(f"{name}: {mark} ({tss}, цена: {price_str})")
+        elif tss:
             lines.append(f"{name}: {mark} ({tss})")
         else:
             lines.append(f"{name}: {mark}")
@@ -317,6 +357,7 @@ async def _send_flip(symbol: str, ep: dict):
 
     await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
     ep["state"] = "FLIPPED"
+
 
 # === MAIN AGGREGATOR =======================================================
 
@@ -336,9 +377,9 @@ async def process_signal_v0(
     ep = _get_episode(symbol)
 
     _update_ttl(ep, now_ts)
-    _set_signal(ep, signal, timeframe)
+    _set_signal(ep, signal, timeframe, close_price)
 
-    # Update pump levels
+    # Update pump levels from high/low
     if signal in ("A1", "A2"):
         if high_price is not None:
             if ep["high_pump"] is None or high_price > ep["high_pump"]:
@@ -360,27 +401,30 @@ async def process_signal_v0(
 
     # FLIP logic (>=2 L-signals)
     if _count_l_signals(ep) >= 2 and ep["state"] != "FLIPPED":
-        await _send_flip(symbol, ep)
+        await _send_flip(symbol, ep, close_price, btc_corr, btc_trend)
         return
 
-    # SETUP requirements
+    # SETUP/UPGRADE logic
     has_core = _signal_active(ep, "A1") and _signal_active(ep, "A2")
     confirms = _count_confirms(ep)
     has_maxpower = _has_maxpower(ep)
     btc_ok, _ = _btc_guard_ok(btc_corr, btc_trend)
 
     if not has_core or not has_maxpower or not btc_ok:
+        ep["last_strength"] = confirms
         return
 
-    if ep["state"] in ("IDLE",) and confirms >= 3:
-        await _send_setup(symbol, ep, btc_corr, btc_trend)
+    if ep["state"] == "IDLE" and confirms >= 3:
+        await _send_setup(symbol, ep, btc_corr, btc_trend, close_price)
         return
 
-    if ep["state"] == "SETUP":
-        old_strength = _count_confirms(ep)
-        new_strength = _count_confirms(ep)
-        if new_strength > old_strength:
-            await _send_upgrade(symbol, ep, old_strength, new_strength)
+    if ep["state"] == "SETUP" and confirms > ep.get("last_strength", 0):
+        old_str = ep.get("last_strength", 0)
+        await _send_upgrade(symbol, ep, old_str, confirms, close_price)
+        return
+
+    ep["last_strength"] = confirms
+
 
 # =========================================================
 #               NEW /tv_v0 simplified endpoint
