@@ -408,22 +408,35 @@ async def process_signal_v0(
     has_core = _signal_active(ep, "A1") and _signal_active(ep, "A2")
     confirms = _count_confirms(ep)
     has_maxpower = _has_maxpower(ep)
-    btc_ok, _ = _btc_guard_ok(btc_corr, btc_trend)
+    btc_ok, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
 
+    # Если нет ядра, нет MaxPower или BTC-Guard блокирует — SETUP не даём
     if not has_core or not has_maxpower or not btc_ok:
+        # Логируем отдельно случай, когда именно BTC-Guard заблокировал
+        if not btc_ok:
+            print(
+                f"[BTC-GUARD BLOCK] symbol={symbol}, tf={timeframe}, "
+                f"corr={btc_corr}, trend={btc_trend}, comment={btc_comment}"
+            )
         ep["last_strength"] = confirms
         return
 
+    # Первый SETUP, когда все условия выполнены
     if ep["state"] == "IDLE" and confirms >= 3:
         await _send_setup(symbol, ep, btc_corr, btc_trend, close_price)
+        ep["last_strength"] = confirms
         return
 
+    # UPGRADE, если добавилось подтверждений
     if ep["state"] == "SETUP" and confirms > ep.get("last_strength", 0):
         old_str = ep.get("last_strength", 0)
         await _send_upgrade(symbol, ep, old_str, confirms, close_price)
+        ep["last_strength"] = confirms
         return
 
+    # Обновляем last_strength, если ничего не произошло, но число confirm изменилось
     ep["last_strength"] = confirms
+
 
 
 # =========================================================
