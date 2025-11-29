@@ -42,13 +42,19 @@ def _now() -> float:
 
 
 def _now_msk_str() -> str:
+    """Дата+время, используется в шапке сообщений."""
     return datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
+
+
+def _now_msk_time_str() -> str:
+    """Только время, для сигнальных строк."""
+    return datetime.now(MSK_TZ).strftime("%H:%M:%S MSK")
 
 
 # === HELPERS ===
 
 def _fmt_price(p) -> str:
-    """Format price as plain decimal string (up to 8 decimals)."""
+    """Форматируем цену: до 8 знаков, без e-06 и хвостовых нулей."""
     if p is None:
         return "—"
     s = f"{p:.8f}".rstrip("0").rstrip(".")
@@ -56,16 +62,32 @@ def _fmt_price(p) -> str:
 
 
 async def send_telegram(chat_id: str, text: str, disable_preview: bool = True):
-    """Send plain text message to Telegram (no Markdown)."""
+    """
+    Отправляем plain text в Telegram.
+    При ошибках (особенно 429 Too Many Requests) НЕ роняем приложение.
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": disable_preview,
     }
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code
+        if status == 429:
+            print("[TELEGRAM 429] Too Many Requests. Message dropped.")
+            return
+        else:
+            print(f"[TELEGRAM HTTP ERROR] status={status}, detail={e}")
+            return
+    except Exception as e:
+        print(f"[TELEGRAM EXCEPTION] {e}")
+        return
 
 
 @app.get("/")
@@ -128,7 +150,7 @@ async def tv_webhook(request: Request):
 
 
 # =========================================================
-#            ANTI-FOMO v0.9.2 AGGREGATOR
+#            ANTI-FOMO v0.9.x AGGREGATOR
 # =========================================================
 
 def _get_episode(symbol: str) -> dict:
@@ -169,7 +191,7 @@ def _set_signal(ep: dict, name: str, timeframe: str, price: float):
     ep["signals"].setdefault(name, {})
     info = ep["signals"][name]
     info["active"] = True
-    info["ts_str"] = _now_msk_str()
+    info["ts_str"] = _now_msk_time_str()  # только время
     info["server_ts"] = _now()
     info["timeframe"] = timeframe
     info["price"] = price
@@ -204,7 +226,7 @@ def _btc_guard_ok(btc_corr, btc_trend):
 
 
 def _format_signals_block(ep: dict) -> str:
-    """Return multiline description of signals with time and price."""
+    """Возвращаем список строк: индикатор — статус, цена, время."""
     lines = []
 
     def add(name, desc):
@@ -214,14 +236,17 @@ def _format_signals_block(ep: dict) -> str:
         price = info.get("price", None)
         price_str = _fmt_price(price)
         if tss and price is not None:
-            lines.append(f"{name} – {desc}: {mark} ({tss}, цена: {price_str})")
+            lines.append(f"{name} – {desc}: {mark}, цена {price_str}, время {tss}")
         elif tss:
-            lines.append(f"{name} – {desc}: {mark} ({tss})")
+            lines.append(f"{name} – {desc}: {mark}, время {tss}")
         else:
             lines.append(f"{name} – {desc}: {mark}")
 
+    # Core
     add("A1", "Памп (MicroPump)")
     add("A2", "Перегрев EMA (Overextension)")
+
+    # Confirm
     add("A3", "Volume Spike")
     add("A4", "Rejection Wick")
     add("A5", "LH/LL Structure")
@@ -231,6 +256,7 @@ def _format_signals_block(ep: dict) -> str:
     add("A11", "CRSI 80 DOWN")
     add("A12", "Volume Exhaustion 1H")
 
+    # L-сигналы
     add("A9L", "SuperTrend 1H UP (L)")
     add("A10L", "CRSI 80 DOWN (L)")
     add("A11L", "CRSI 20 UP (L)")
@@ -259,7 +285,6 @@ async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend, setup_price: f
     _, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
     strength = _count_confirms(ep)
     block = _format_signals_block(ep)
-    block_lines = block.split("\n")
 
     lines = []
     lines.append("[SETUP READY] ANTI-FOMO SHORT")
@@ -268,11 +293,11 @@ async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend, setup_price: f
     lines.append(f"Цена SETUP: {_fmt_price(setup_price)}")
     lines.append("")
     lines.append("Core (A1, A2):")
-    for l in block_lines[:2]:
+    for l in block.split("\n")[:2]:
         lines.append(l)
     lines.append("")
     lines.append(f"Confirm сигналы: {strength}/8")
-    for l in block_lines[2:10]:
+    for l in block.split("\n")[2:10]:
         lines.append(l)
     lines.append("")
     lines.append(f"BTC-Guard: {btc_comment}")
@@ -347,9 +372,9 @@ async def _send_flip(symbol: str, ep: dict, flip_price: float, btc_corr, btc_tre
         price = info.get("price", None)
         price_str = _fmt_price(price)
         if tss and price is not None:
-            lines.append(f"{name}: {mark} ({tss}, цена: {price_str})")
+            lines.append(f"{name}: {mark}, цена {price_str}, время {tss}")
         elif tss:
-            lines.append(f"{name}: {mark} ({tss})")
+            lines.append(f"{name}: {mark}, время {tss}")
         else:
             lines.append(f"{name}: {mark}")
     lines.append("")
@@ -404,15 +429,20 @@ async def process_signal_v0(
         await _send_flip(symbol, ep, close_price, btc_corr, btc_trend)
         return
 
-    # SETUP/UPGRADE logic
+    # SETUP/UPGRADE logic + телеметрия
     has_core = _signal_active(ep, "A1") and _signal_active(ep, "A2")
     confirms = _count_confirms(ep)
     has_maxpower = _has_maxpower(ep)
     btc_ok, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
 
-    # Если нет ядра, нет MaxPower или BTC-Guard блокирует — SETUP не даём
+    # Телеметрия по сетапу
+    print(
+        f"[SETUP CHECK] symbol={symbol}, tf={timeframe}, "
+        f"core={has_core}, confirms={confirms}, maxpower={has_maxpower}, btc_ok={btc_ok}"
+    )
+
+    # Если нет ядра, MaxPower или BTC-Guard блокирует — SETUP не даём
     if not has_core or not has_maxpower or not btc_ok:
-        # Логируем отдельно случай, когда именно BTC-Guard заблокировал
         if not btc_ok:
             print(
                 f"[BTC-GUARD BLOCK] symbol={symbol}, tf={timeframe}, "
@@ -421,22 +451,18 @@ async def process_signal_v0(
         ep["last_strength"] = confirms
         return
 
-    # Первый SETUP, когда все условия выполнены
+    # Первый SETUP, когда всё совпало
     if ep["state"] == "IDLE" and confirms >= 3:
         await _send_setup(symbol, ep, btc_corr, btc_trend, close_price)
-        ep["last_strength"] = confirms
         return
 
-    # UPGRADE, если добавилось подтверждений
+    # UPGRADE, если сила сетапа выросла
     if ep["state"] == "SETUP" and confirms > ep.get("last_strength", 0):
         old_str = ep.get("last_strength", 0)
         await _send_upgrade(symbol, ep, old_str, confirms, close_price)
-        ep["last_strength"] = confirms
         return
 
-    # Обновляем last_strength, если ничего не произошло, но число confirm изменилось
     ep["last_strength"] = confirms
-
 
 
 # =========================================================
