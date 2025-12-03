@@ -6,6 +6,9 @@ from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 
+# === NEW: BTC-Guard module ===
+from btc_guard.btc_guard import BTCGuard, BTCGuardConfig, BTCDecision
+
 app = FastAPI()
 
 # === ENVIRONMENT VARIABLES ===
@@ -35,6 +38,9 @@ L_SIGNALS = {"A9L", "A10L", "A11L"}
 # === TIMEZONE (MSK) ===
 
 MSK_TZ = timezone(timedelta(hours=3))
+
+# === NEW: BTC-Guard instance ===
+btc_guard = BTCGuard(BTCGuardConfig())
 
 
 def _now() -> float:
@@ -119,7 +125,7 @@ async def tv_webhook(request: Request):
     sl = data.get("sl", "—")
     tps = data.get("tps", [])
     conf = data.get("confidence", "—")
-    btc_guard = data.get("btc_guard", "—")
+    btc_guard_legacy = data.get("btc_guard", "—")
     volume_fade = data.get("volume_fade", "—")
     liq = data.get("liquidity_mode", "HL")
     reason = data.get("reason", "—")
@@ -139,7 +145,7 @@ async def tv_webhook(request: Request):
     lines.append(f"TF: {timeframe}   SIDE: {side}   LIQ: {liq}")
     lines.append(f"Entry: {entry}   SL: {sl}")
     lines.append(f"TPs: {tps_str}   Conf: {conf}")
-    lines.append(f"BTC-Guard: {btc_guard}   VolFade: {volume_fade}")
+    lines.append(f"BTC-Guard: {btc_guard_legacy}   VolFade: {volume_fade}")
     if ts:
         lines.append(f"Time: {ts}")
     if reason:
@@ -467,6 +473,7 @@ async def process_signal_v0(
 
 # =========================================================
 #               NEW /tv_v0 simplified endpoint
+#               + BTCGuard integration
 # =========================================================
 
 @app.post("/tv_v0")
@@ -499,12 +506,52 @@ async def tv_webhook_v0(request: Request):
     btc_corr = data.get("btc_corr", 0.0)
     btc_trend = data.get("btc_trend", "UNKNOWN")
 
-    key = f"v0:{symbol}:{timeframe}:{side}:{signal}"
     now_ts = _now()
+
+    # 1) BTC tick — только для BTCUSDT, не запускаем AntiFOMO
+    if "BTCUSDT" in symbol:
+        if close_price is not None:
+            btc_guard.on_btc_tick(now_ts=now_ts, close_price=close_price)
+        state = btc_guard.get_state().value
+        print(f"[BTCGuard] BTC tick symbol={symbol}, price={close_price}, state={state}")
+        return {"status": "btc_tick", "symbol": symbol, "btc_state": state}
+
+    # 2) Cooldown на сигналы по альтам
+    key = f"v0:{symbol}:{timeframe}:{side}:{signal}"
     if now_ts - _last_by_key.get(key, 0) < COOLDOWN:
         return {"status": "cooldown_skip"}
     _last_by_key[key] = now_ts
 
+    # 3) BTCGuard по монете — решаем, пускать ли сигнал в AntiFOMO
+    try:
+        corr_val = float(btc_corr)
+    except Exception:
+        corr_val = 0.0
+
+    decision = btc_guard.handle_signal(
+        symbol=symbol,
+        side=side,
+        btc_corr=corr_val,
+        now_ts=now_ts,
+        ts_str=ts_str,
+        signal_name=signal,
+    )
+
+    if decision == BTCDecision.DEFER:
+        state = btc_guard.get_state().value
+        print(
+            f"[BTCGuard] DEFER symbol={symbol}, signal={signal}, "
+            f"side={side}, corr={corr_val:.2f}, state={state}"
+        )
+        return {
+            "status": "deferred",
+            "symbol": symbol,
+            "signal": signal,
+            "btc_state": state,
+            "corr": corr_val,
+        }
+
+    # 4) Если ALLOW — запускаем обычную AntiFOMO-логику
     await process_signal_v0(
         symbol=symbol,
         timeframe=timeframe,
@@ -518,4 +565,9 @@ async def tv_webhook_v0(request: Request):
         btc_trend=btc_trend,
     )
 
-    return {"status": "ok", "symbol": symbol, "signal": signal}
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "signal": signal,
+        "btc_state": btc_guard.get_state().value,
+    }
