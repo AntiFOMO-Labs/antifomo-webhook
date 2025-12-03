@@ -7,7 +7,7 @@ from fastapi import FastAPI, Request, HTTPException
 import httpx
 
 # === NEW: BTC-Guard module ===
-from btc_guard.btc_guard import BTCGuard, BTCGuardConfig, BTCDecision
+from btc_guard.btc_guard import BTCGuard, BTCGuardConfig, BTCDecision, BTCGuardState
 
 app = FastAPI()
 
@@ -39,8 +39,10 @@ L_SIGNALS = {"A9L", "A10L", "A11L"}
 
 MSK_TZ = timezone(timedelta(hours=3))
 
-# === NEW: BTC-Guard instance ===
+# === BTC-Guard INSTANCE + STATE TRACKER ===
+
 btc_guard = BTCGuard(BTCGuardConfig())
+BTC_PREV_STATE: BTCGuardState | None = None
 
 
 def _now() -> float:
@@ -85,20 +87,31 @@ async def send_telegram(chat_id: str, text: str, disable_preview: bool = True):
             r.raise_for_status()
     except httpx.HTTPStatusError as e:
         status = e.response.status_code
-        if status == 429:
-            print("[TELEGRAM 429] Too Many Requests. Message dropped.")
-            return
-        else:
-            print(f"[TELEGRAM HTTP ERROR] status={status}, detail={e}")
-            return
+        print(f"[TELEGRAM HTTP ERROR] status={status}, detail={e}")
     except Exception as e:
         print(f"[TELEGRAM EXCEPTION] {e}")
-        return
 
 
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "AntiFOMO webhook running"}
+
+
+# =========================================================
+#           LIQUIDITY ENGINE (ЗАГЛУШКА)
+# =========================================================
+
+def _get_liquidity_level(symbol: str) -> str:
+    """
+    ВРЕМЕННАЯ ЗАГЛУШКА.
+    Позже сюда подключим Liquidity Engine с Binance API.
+
+    Сейчас:
+      - возвращаем "MEDIUM" для всех монет.
+      - логику BTCGuard по liq_level уже заложили: LOW/ULTRA_LOW будут блокироваться в ALERT.
+    """
+    # TODO: заменить на реальный уровень ликвидности после подключения Binance API
+    return "MEDIUM"
 
 
 # =========================================================
@@ -173,6 +186,12 @@ def _get_episode(symbol: str) -> dict:
             "last_upgrade_ts": None,
             "last_retest_ts": None,
             "last_strength": 0,
+            # BTC-Guard per-coin metrics
+            "corr_hist": None,
+            "corr_hist_samples": 0,
+            "last_btc_corr": None,
+            # Liquidity info
+            "liq_level": None,
         }
         EPISODES[symbol] = ep
     return ep
@@ -219,16 +238,97 @@ def _count_l_signals(ep: dict) -> int:
     return sum(_signal_active(ep, s) for s in L_SIGNALS)
 
 
-def _btc_guard_ok(btc_corr, btc_trend):
+def _update_corr_hist(ep: dict, btc_corr) -> None:
+    """
+    Обновляем сглаженную историческую корреляцию монеты с BTC.
+    """
     try:
-        corr = float(btc_corr)
+        corr_now = float(btc_corr)
     except Exception:
-        corr = 0.0
-    trend = str(btc_trend).upper()
+        return
 
-    if trend == "UP" and corr > 0.7:
-        return False, f"Корреляция: {corr:.2f}, BTC: UP — BLOCK"
-    return True, f"Корреляция: {corr:.2f}, BTC: {trend}"
+    if corr_now < 0 or corr_now > 1.5:
+        return
+
+    ep["last_btc_corr"] = corr_now
+
+    prev = ep.get("corr_hist")
+    n = ep.get("corr_hist_samples", 0)
+
+    alpha = 0.2  # скорость адаптации (0.1–0.3 норм)
+    if prev is None or n == 0:
+        new_val = corr_now
+        n = 1
+    else:
+        new_val = prev + alpha * (corr_now - prev)
+        n += 1
+
+    ep["corr_hist"] = new_val
+    ep["corr_hist_samples"] = n
+
+
+def _btc_guard_ok(btc_corr, btc_trend, corr_hist=None):
+    """
+    Возвращает:
+      ok:      True/False — можно ли выдавать SETUP/UPGRADE с точки зрения BTC
+      comment: строка для сообщений вида:
+               "now 23% (weak), hist 68% (strong), BTC: UP"
+    """
+    try:
+        corr_now = float(btc_corr)
+    except Exception:
+        corr_now = 0.0
+
+    trend = (str(btc_trend) or "UNKNOWN").upper()
+
+    if corr_hist is None:
+        hist_val = corr_now
+    else:
+        try:
+            hist_val = float(corr_hist)
+        except Exception:
+            hist_val = corr_now
+
+    def _level(c: float) -> str:
+        if c < 0.2:
+            return "very weak"
+        if c < 0.4:
+            return "weak"
+        if c < 0.7:
+            return "medium"
+        if c < 0.85:
+            return "strong"
+        return "extreme"
+
+    level_now = _level(corr_now)
+    level_hist = _level(hist_val)
+
+    now_pct = corr_now * 100.0
+    hist_pct = hist_val * 100.0
+
+    # Локальный блокер (микро-guard для текстов) — оставляем старую логику:
+    # если BTC UP и corr_now > 0.7 → ok = False
+    if trend == "UP" and corr_now > 0.7:
+        ok = False
+    else:
+        ok = True
+
+    comment = (
+        f"now {now_pct:.0f}% ({level_now}), "
+        f"hist {hist_pct:.0f}% ({level_hist}), "
+        f"BTC: {trend}"
+    )
+
+    return ok, comment
+
+
+def _format_liquidity(liq_level: str | None) -> str:
+    liq = (liq_level or "UNKNOWN").upper()
+    if liq in ("LOW", "ULTRA_LOW"):
+        return f"Liquidity: {liq} ⚠"
+    if liq in ("HIGH", "MEDIUM"):
+        return f"Liquidity: {liq}"
+    return "Liquidity: UNKNOWN"
 
 
 def _format_signals_block(ep: dict) -> str:
@@ -288,7 +388,7 @@ async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend, setup_price: f
     ts = _now_msk_str()
     ep["setup_ts"] = _now()
 
-    _, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
+    _, btc_comment = _btc_guard_ok(btc_corr, btc_trend, ep.get("corr_hist"))
     strength = _count_confirms(ep)
     block = _format_signals_block(ep)
 
@@ -307,18 +407,22 @@ async def _send_setup(symbol: str, ep: dict, btc_corr, btc_trend, setup_price: f
         lines.append(l)
     lines.append("")
     lines.append(f"BTC-Guard: {btc_comment}")
+    lines.append(_format_liquidity(ep.get("liq_level")))
 
     await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
     ep["state"] = "SETUP"
     ep["last_strength"] = strength
 
 
-async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: int, upgrade_price: float):
+async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: int,
+                        upgrade_price: float, btc_corr, btc_trend):
     ts = _now_msk_str()
     setup_ts = ep.get("setup_ts")
     setup_str = ""
     if setup_ts:
         setup_str = datetime.fromtimestamp(setup_ts, MSK_TZ).strftime("%Y-%m-%d %H:%M:%S MSK")
+
+    _, btc_comment = _btc_guard_ok(btc_corr, btc_trend, ep.get("corr_hist"))
 
     lines = []
     lines.append("[UPGRADE] SHORT SETUP STRENGTHENED")
@@ -329,6 +433,8 @@ async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: 
     lines.append(f"Цена UPGRADE: {_fmt_price(upgrade_price)}")
     lines.append("")
     lines.append(f"Сила сетапа: было {old_strength}/8 -> стало {new_strength}/8")
+    lines.append(f"BTC-Guard: {btc_comment}")
+    lines.append(_format_liquidity(ep.get("liq_level")))
     lines.append("")
     lines.append("Сигналы:")
     lines.append(_format_signals_block(ep))
@@ -338,10 +444,11 @@ async def _send_upgrade(symbol: str, ep: dict, old_strength: int, new_strength: 
     ep["last_strength"] = new_strength
 
 
-async def _send_retest(symbol: str, ep: dict, close_price: float):
+async def _send_retest(symbol: str, ep: dict, close_price: float, btc_corr, btc_trend):
     ts = _now_msk_str()
     hp = ep.get("high_pump")
     lp = ep.get("low_after_pump")
+    _, btc_comment = _btc_guard_ok(btc_corr, btc_trend, ep.get("corr_hist"))
 
     lines = []
     lines.append("[RETEST] SHORT SCENARIO UNDER ATTACK")
@@ -353,6 +460,9 @@ async def _send_retest(symbol: str, ep: dict, close_price: float):
     lines.append(f"Low отката: {_fmt_price(lp)}")
     lines.append(f"Цена ретеста: {_fmt_price(close_price)}")
     lines.append("")
+    lines.append(f"BTC-Guard: {btc_comment}")
+    lines.append(_format_liquidity(ep.get("liq_level")))
+    lines.append("")
     lines.append("Статус: шортовый сценарий под угрозой.")
 
     await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
@@ -360,7 +470,7 @@ async def _send_retest(symbol: str, ep: dict, close_price: float):
 
 async def _send_flip(symbol: str, ep: dict, flip_price: float, btc_corr, btc_trend):
     ts = _now_msk_str()
-    _, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
+    _, btc_comment = _btc_guard_ok(btc_corr, btc_trend, ep.get("corr_hist"))
 
     lines = []
     lines.append("[FLIP -> LONG] TREND REVERSAL")
@@ -369,6 +479,7 @@ async def _send_flip(symbol: str, ep: dict, flip_price: float, btc_corr, btc_tre
     lines.append(f"Цена Flip: {_fmt_price(flip_price)}")
     lines.append("")
     lines.append(f"BTC-Guard: {btc_comment}")
+    lines.append(_format_liquidity(ep.get("liq_level")))
     lines.append("")
     lines.append("L-сигналы:")
     for name in ("A9L", "A10L", "A11L"):
@@ -403,11 +514,16 @@ async def process_signal_v0(
     low_price: float,
     btc_corr,
     btc_trend,
+    liq_level: str,
 ):
     now_ts = _now()
     ep = _get_episode(symbol)
 
+    # обновляем TTL и корреляцию / ликвидность
     _update_ttl(ep, now_ts)
+    _update_corr_hist(ep, btc_corr)
+    ep["liq_level"] = liq_level
+
     _set_signal(ep, signal, timeframe, close_price)
 
     # Update pump levels from high/low
@@ -427,7 +543,7 @@ async def process_signal_v0(
     if close_price is not None and _calc_retest(ep, close_price):
         last_rt = ep.get("last_retest_ts")
         if not last_rt or now_ts - last_rt > 300:
-            await _send_retest(symbol, ep, close_price)
+            await _send_retest(symbol, ep, close_price, btc_corr, btc_trend)
             ep["last_retest_ts"] = now_ts
 
     # FLIP logic (>=2 L-signals)
@@ -439,19 +555,20 @@ async def process_signal_v0(
     has_core = _signal_active(ep, "A1") and _signal_active(ep, "A2")
     confirms = _count_confirms(ep)
     has_maxpower = _has_maxpower(ep)
-    btc_ok, btc_comment = _btc_guard_ok(btc_corr, btc_trend)
+    btc_ok, btc_comment = _btc_guard_ok(btc_corr, btc_trend, ep.get("corr_hist"))
 
     # Телеметрия по сетапу
     print(
         f"[SETUP CHECK] symbol={symbol}, tf={timeframe}, "
-        f"core={has_core}, confirms={confirms}, maxpower={has_maxpower}, btc_ok={btc_ok}"
+        f"core={has_core}, confirms={confirms}, maxpower={has_maxpower}, btc_ok={btc_ok}, "
+        f"btc_comment={btc_comment}, liq={liq_level}"
     )
 
     # Если нет ядра, MaxPower или BTC-Guard блокирует — SETUP не даём
     if not has_core or not has_maxpower or not btc_ok:
         if not btc_ok:
             print(
-                f"[BTC-GUARD BLOCK] symbol={symbol}, tf={timeframe}, "
+                f"[BTC-GUARD LOCAL BLOCK] symbol={symbol}, tf={timeframe}, "
                 f"corr={btc_corr}, trend={btc_trend}, comment={btc_comment}"
             )
         ep["last_strength"] = confirms
@@ -465,10 +582,87 @@ async def process_signal_v0(
     # UPGRADE, если сила сетапа выросла
     if ep["state"] == "SETUP" and confirms > ep.get("last_strength", 0):
         old_str = ep.get("last_strength", 0)
-        await _send_upgrade(symbol, ep, old_str, confirms, close_price)
+        await _send_upgrade(symbol, ep, old_str, confirms, close_price, btc_corr, btc_trend)
         return
 
     ep["last_strength"] = confirms
+
+
+# =========================================================
+#          SNAPSHOT ПО КОРРЕЛЯЦИЯМ В WARNING/ALERT
+# =========================================================
+
+async def _send_btc_corr_snapshot(mode: str):
+    """
+    Отправляет в Telegram снимок монет в состоянии SETUP
+    с их текущей и исторической корреляцией и ликвидностью.
+    mode: "WARNING" или "ALERT"
+    """
+    header = "BTC-GUARD SNAPSHOT"
+    if mode == "WARNING":
+        header = "BTC-GUARD WARNING ⚠"
+    elif mode == "ALERT":
+        header = "BTC-GUARD ALERT 🚨"
+
+    lines = []
+    lines.append(header)
+    if mode == "WARNING":
+        lines.append("BTC ускоряется. Активные шорт-сетапы и их связь с BTC:")
+    elif mode == "ALERT":
+        lines.append("BTC в сильном импульсе. АнтиФОМО фильтрует монеты по корреляции и ликвидности.")
+    else:
+        lines.append("Текущая картина шорт-сетапов:")
+
+    lines.append("")
+    lines.append("Монета | Corr_now | Corr_hist | Liq | Уровень")
+
+    rows = []
+
+    for symbol, ep in EPISODES.items():
+        if ep.get("state") != "SETUP":
+            continue
+
+        corr_now = ep.get("last_btc_corr")
+        corr_hist = ep.get("corr_hist")
+        liq = (ep.get("liq_level") or "UNKNOWN").upper()
+
+        if corr_now is None and corr_hist is None:
+            continue
+
+        sort_val = corr_now if corr_now is not None else (corr_hist or 0.0)
+        rows.append((symbol, corr_now, corr_hist, liq, sort_val))
+
+    if not rows:
+        lines.append("Нет активных монет в состоянии SETUP с данными по корреляции.")
+        await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
+        return
+
+    rows.sort(key=lambda x: x[4], reverse=True)
+
+    def _fmt_corr(c):
+        if c is None:
+            return "—"
+        return f"{c * 100:.0f}%"
+
+    def _level(c: float) -> str:
+        if c < 0.2:
+            return "very weak"
+        if c < 0.4:
+            return "weak"
+        if c < 0.7:
+            return "medium"
+        if c < 0.85:
+            return "strong"
+        return "extreme"
+
+    for symbol, corr_now, corr_hist, liq, _ in rows:
+        base = corr_now if corr_now is not None else (corr_hist or 0.0)
+        level = _level(base)
+        lines.append(
+            f"{symbol} | {_fmt_corr(corr_now)} | {_fmt_corr(corr_hist)} | {liq} | {level}"
+        )
+
+    await send_telegram(CHAT_ID_TRADING, "\n".join(lines))
 
 
 # =========================================================
@@ -478,6 +672,8 @@ async def process_signal_v0(
 
 @app.post("/tv_v0")
 async def tv_webhook_v0(request: Request):
+    global BTC_PREV_STATE
+
     raw = await request.body()
     try:
         data = json.loads(raw.decode("utf-8"))
@@ -510,11 +706,28 @@ async def tv_webhook_v0(request: Request):
 
     # 1) BTC tick — только для BTCUSDT, не запускаем AntiFOMO
     if "BTCUSDT" in symbol:
+        prev_state = BTC_PREV_STATE or btc_guard.get_state()
         if close_price is not None:
             btc_guard.on_btc_tick(now_ts=now_ts, close_price=close_price)
-        state = btc_guard.get_state().value
-        print(f"[BTCGuard] BTC tick symbol={symbol}, price={close_price}, state={state}")
-        return {"status": "btc_tick", "symbol": symbol, "btc_state": state}
+        new_state = btc_guard.get_state()
+
+        if prev_state != new_state:
+            # при смене состояния шлём snapshot
+            if new_state == BTCGuardState.WARNING:
+                await _send_btc_corr_snapshot(mode="WARNING")
+            elif new_state == BTCGuardState.ALERT:
+                await _send_btc_corr_snapshot(mode="ALERT")
+            elif new_state == BTCGuardState.IDLE:
+                # можно коротко сообщить о стабилизации, если нужно
+                await send_telegram(
+                    CHAT_ID_TRADING,
+                    "BTC-GUARD IDLE ✅\nBTC стабилизировался. AntiFOMO вернулся в обычный режим."
+                )
+
+        BTC_PREV_STATE = new_state
+
+        print(f"[BTCGuard] BTC tick symbol={symbol}, price={close_price}, state={new_state.value}")
+        return {"status": "btc_tick", "symbol": symbol, "btc_state": new_state.value}
 
     # 2) Cooldown на сигналы по альтам
     key = f"v0:{symbol}:{timeframe}:{side}:{signal}"
@@ -522,7 +735,10 @@ async def tv_webhook_v0(request: Request):
         return {"status": "cooldown_skip"}
     _last_by_key[key] = now_ts
 
-    # 3) BTCGuard по монете — решаем, пускать ли сигнал в AntiFOMO
+    # 3) Liquidity level (пока через заглушку)
+    liq_level = _get_liquidity_level(symbol)
+
+    # 4) BTCGuard по монете — решаем, пускать ли сигнал в AntiFOMO
     try:
         corr_val = float(btc_corr)
     except Exception:
@@ -532,6 +748,7 @@ async def tv_webhook_v0(request: Request):
         symbol=symbol,
         side=side,
         btc_corr=corr_val,
+        liq_level=liq_level,
         now_ts=now_ts,
         ts_str=ts_str,
         signal_name=signal,
@@ -541,7 +758,7 @@ async def tv_webhook_v0(request: Request):
         state = btc_guard.get_state().value
         print(
             f"[BTCGuard] DEFER symbol={symbol}, signal={signal}, "
-            f"side={side}, corr={corr_val:.2f}, state={state}"
+            f"side={side}, corr={corr_val:.2f}, liq={liq_level}, state={state}"
         )
         return {
             "status": "deferred",
@@ -549,9 +766,10 @@ async def tv_webhook_v0(request: Request):
             "signal": signal,
             "btc_state": state,
             "corr": corr_val,
+            "liq": liq_level,
         }
 
-    # 4) Если ALLOW — запускаем обычную AntiFOMO-логику
+    # 5) Если ALLOW — запускаем обычную AntiFOMO-логику
     await process_signal_v0(
         symbol=symbol,
         timeframe=timeframe,
@@ -563,6 +781,7 @@ async def tv_webhook_v0(request: Request):
         low_price=low_price,
         btc_corr=btc_corr,
         btc_trend=btc_trend,
+        liq_level=liq_level,
     )
 
     return {
@@ -570,4 +789,5 @@ async def tv_webhook_v0(request: Request):
         "symbol": symbol,
         "signal": signal,
         "btc_state": btc_guard.get_state().value,
+        "liq": liq_level,
     }
