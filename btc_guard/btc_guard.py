@@ -1,23 +1,38 @@
-# btc_guard.py
+# btc_guard/btc_guard.py
 #
-# BTCGuard v2.1 (Per-Coin)
+# BTCGuard v2.2-P(LQ)
+#
 # Двухслойная защита:
-# 1) Глобальное состояние BTC: IDLE / WARNING / ALERT (по его импульсу)
-# 2) Локальное решение по монете: по btc_corr решаем, блокировать ли шорт
+# 1) Глобальное состояние BTC: IDLE / WARNING / ALERT (по импульсу BTC)
+# 2) Локальное решение по монете: по btc_corr и liq_level решаем, блокировать ли SHORT
 #
 # Интерфейс:
 #   guard = BTCGuard()
-#   guard.on_btc_tick(now_ts=time.time(), close_price=price_btc)
-#   decision = guard.handle_signal(symbol, side, btc_corr, now_ts, ts_str, signal_name)
 #
-#   if decision == BTCDecision.DEFER:  -> сигнал откладываем (BTC тащит и монета сильно коррелирует)
-#   if decision == BTCDecision.ALLOW:  -> пропускаем сигнал в AntiFOMO
+#   # тик по BTCUSDT (1m / 5m)
+#   guard.on_btc_tick(now_ts=time.time(), close_price=btc_price)
+#
+#   # сигнал по монете
+#   decision = guard.handle_signal(
+#       symbol="BINANCE:BOMEUSDT.P",
+#       side="SHORT",
+#       btc_corr=0.23,
+#       liq_level="HIGH",   # "HIGH" / "MEDIUM" / "LOW" / "ULTRA_LOW" / None
+#       now_ts=time.time(),
+#       ts_str="2025-12-04 12:34:56",
+#       signal_name="A12",
+#   )
+#
+#   if decision == BTCDecision.DEFER:
+#       # глушим сигнал (не запускаем AntiFOMO по этой монете)
+#   if decision == BTCDecision.ALLOW:
+#       # пускаем сигнал в обычную логику AntiFOMO
+
 
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
-from datetime import timedelta
+from typing import List, Optional, Dict, Tuple
 
 
 class BTCGuardState(Enum):
@@ -28,26 +43,35 @@ class BTCGuardState(Enum):
 
 class BTCDecision(Enum):
     ALLOW = "ALLOW"   # пропускаем сигнал дальше
-    DEFER = "DEFER"   # откладываем сигнал (BTC импульс + сильная корреляция по монете)
-    BLOCK = "BLOCK"   # жёстко игнорируем (пока не используем)
+    DEFER = "DEFER"   # откладываем сигнал (BTC импульс + риск по монете)
+    BLOCK = "BLOCK"   # жёстко игнорируем (пока не используем отдельно)
 
 
 @dataclass
 class BTCGuardConfig:
-    # Пороговые значения для импульса BTC
+    # Пороговые значения для импульса BTC (на глобальном уровне)
     warning_threshold_5m: float = 0.7    # % за 5 минут
     warning_threshold_15m: float = 1.5   # % за 15 минут
     warning_threshold_30m: float = 2.0   # % за 30 минут
 
     alert_threshold_5_15: float = 1.8    # % за 5–15 минут для ALERT
 
-    # Порог по корреляции для блокировки шорта
-    corr_block_threshold: float = 0.7    # выше этого — монета ходит за BTC, шорт опасен
+    # Порог по корреляции для жёсткой блокировки
+    corr_block_threshold: float = 0.70   # corr_now >= 0.70 → блок
 
-    # TTL для отложенных сигналов
-    deferred_ttl_min: int = 45
+    # "Слабая" корреляция (используется для логики "была слабой → стала средней")
+    weak_corr_max: float = 0.40         # ниже этого считаем монету слабой
 
-    # окна для расчёта % изменения BTC
+    # Порог "перепривязки": если была слабой, а стала >= этого → блок
+    rebind_corr_threshold: float = 0.55
+
+    # Порог для скачка корреляции
+    delta_corr_block_threshold: float = 0.25  # рост corr_now - corr_prev >= 0.25 → блок
+
+    # TTL для отложенных сигналов (секунды)
+    deferred_ttl_sec: int = 45 * 60
+
+    # Окна для расчёта % изменения BTC
     window_5m: int = 5
     window_15m: int = 15
     window_30m: int = 30
@@ -55,7 +79,7 @@ class BTCGuardConfig:
 
 @dataclass
 class BTCPricePoint:
-    ts: float      # timestamp в секундах (time.time())
+    ts: float      # timestamp (time.time())
     price: float
 
 
@@ -66,28 +90,45 @@ class DeferredItem:
     signal: str
     created_at: float
     raw_ts_str: str
+    btc_corr: float
+    liq_level: str
+    btc_state: str
+
+
+@dataclass
+class SymbolCorrState:
+    last_corr: Optional[float] = None
+    prev_corr: Optional[float] = None
+    last_update_ts: Optional[float] = None
 
 
 class BTCGuard:
     """
-    BTCGuard: умная защита AntiFOMO от входов в шорт против сильного импульса BTC.
+    BTCGuard v2.2-P(LQ):
 
-    - Следит за движением BTC во времени (по тикерам BTCUSDT с TradingView).
+    - Следит за движением BTC (по тикерам BTCUSDT).
     - Переключает состояния: IDLE / WARNING / ALERT.
-    - В ALERT:
-        - если btc_corr монеты >= corr_block_threshold и side == SHORT → DEFER
-        - если btc_corr ниже порога → ALLOW (монета уже отвалилась от BTC).
+    - В ALERT принимает решение по КАЖДОЙ монете:
+        - по btc_corr (текущая и предыдущая),
+        - по delta_corr (насколько быстро выросла связь),
+        - по liq_level (LOW / ULTRA_LOW → блок),
+      и решает:
+        - DEFER (глушим сигнал, не даём шорт в AntiFOMO),
+        - ALLOW (пускаем дальше, даже в ALERT).
     """
 
     def __init__(self, config: Optional[BTCGuardConfig] = None) -> None:
         self.config = config or BTCGuardConfig()
         self.state: BTCGuardState = BTCGuardState.IDLE
 
-        # История BTC (последние ~60 минут)
+        # История BTC за ~60 минут
         self._btc_history: List[BTCPricePoint] = []
 
-        # Отложенные сигналы (на будущее, пока только считаем)
+        # Отложенные сигналы (на будущее, пока используется только для телеметрии)
         self._deferred: List[DeferredItem] = []
+
+        # Состояние корреляции по символам
+        self._symbol_corr: Dict[str, SymbolCorrState] = {}
 
     # ─────────────────────────────────────────
     #           ПУБЛИЧНОЕ API
@@ -96,8 +137,7 @@ class BTCGuard:
     def on_btc_tick(self, now_ts: float, close_price: float) -> None:
         """
         Обновление цены BTC.
-        Вызывается при каждом алерте по BTC (1m, 5m – как настроишь).
-        now_ts — time.time() сервера.
+        Вызывается при каждом алерте по BTC (1m, 5m — как настроено).
         """
         self._add_btc_point(now_ts, close_price)
         self._update_state(now_ts)
@@ -107,6 +147,7 @@ class BTCGuard:
         symbol: str,
         side: str,
         btc_corr: float,
+        liq_level: Optional[str],
         now_ts: float,
         ts_str: str = "",
         signal_name: str = "",
@@ -114,51 +155,90 @@ class BTCGuard:
         """
         Решение по конкретному сигналу по монете.
 
-        - symbol      — пара (BINANCE:BOMEUSDT.P и т.п.)
-        - side        — "SHORT" / "LONG" / "?"
-        - btc_corr    — корреляция монеты с BTC (0..1 из JSON индикатора)
-        - now_ts      — time.time() сервера
-        - ts_str      — строковое время из TradingView (для логов)
-        - signal_name — индикатор (A1, A12, A9L и т.д.)
+        :param symbol:     пара, например "BINANCE:BOMEUSDT.P"
+        :param side:       "SHORT" / "LONG" / "?"
+        :param btc_corr:   текущая корреляция монеты с BTC (0..1)
+        :param liq_level:  "HIGH" / "MEDIUM" / "LOW" / "ULTRA_LOW" / None
+        :param now_ts:     time.time() сервера
+        :param ts_str:     строковое время (для логов)
+        :param signal_name: "A1"/"A12"/"A9L" и т.п.
         """
         self._cleanup_deferred(now_ts)
 
-        # Нас интересуют только SHORT-сигналы
-        if side != "SHORT":
+        # Нас интересуют только шортовые сигналы
+        if side.upper() != "SHORT":
             return BTCDecision.ALLOW
 
-        # Если BTC не в ALERT — ничего не блокируем
+        # Если BTC не в ALERT — не вмешиваемся, пропускаем
         if self.state != BTCGuardState.ALERT:
             return BTCDecision.ALLOW
 
-        # BTC в ALERT → смотрим, насколько монета завязана на него
+        # Нормализуем значения
         try:
-            corr = float(btc_corr)
+            corr_now = float(btc_corr)
         except Exception:
-            corr = 0.0
+            corr_now = 0.0
 
-        if corr >= self.config.corr_block_threshold:
-            # Монета сильно коррелирует с BTC → шорт опасен, откладываем
-            self._defer_signal(symbol, side, signal_name, now_ts, ts_str)
+        liq = (liq_level or "UNKNOWN").upper().strip()
+
+        # Обновляем историю корреляций по символу
+        prev_corr, delta_corr = self._update_symbol_corr(symbol, corr_now, now_ts)
+
+        # Правила блокировки
+        blocked, reason = self._should_block_symbol(
+            symbol=symbol,
+            corr_now=corr_now,
+            prev_corr=prev_corr,
+            delta_corr=delta_corr,
+            liq_level=liq,
+        )
+
+        if blocked:
+            # Откладываем сигнал (DEFER)
+            self._defer_signal(
+                symbol=symbol,
+                side=side,
+                signal_name=signal_name,
+                now_ts=now_ts,
+                ts_str=ts_str,
+                btc_corr=corr_now,
+                liq_level=liq,
+            )
             print(
-                f"[BTCGuard] DEFER symbol={symbol}, side={side}, "
-                f"signal={signal_name}, corr={corr:.2f}, state={self.state.value}"
+                f"[BTCGuard][DEFER] symbol={symbol}, side={side}, "
+                f"signal={signal_name}, corr_now={corr_now:.2f}, "
+                f"prev_corr={prev_corr if prev_corr is not None else 'None'}, "
+                f"delta_corr={delta_corr if delta_corr is not None else 'None'}, "
+                f"liq={liq}, state={self.state.value}, reason={reason}"
             )
             return BTCDecision.DEFER
-        else:
-            # Монета отстаёт от BTC → даём зелёный свет для шорта
-            print(
-                f"[BTCGuard] ALLOW (weak corr) symbol={symbol}, side={side}, "
-                f"signal={signal_name}, corr={corr:.2f}, state={self.state.value}"
-            )
-            return BTCDecision.ALLOW
+
+        # Если не заблокировали — разрешаем
+        print(
+            f"[BTCGuard][ALLOW] symbol={symbol}, side={side}, "
+            f"signal={signal_name}, corr_now={corr_now:.2f}, "
+            f"prev_corr={prev_corr if prev_corr is not None else 'None'}, "
+            f"delta_corr={delta_corr if delta_corr is not None else 'None'}, "
+            f"liq={liq}, state={self.state.value}, reason='OK'"
+        )
+        return BTCDecision.ALLOW
 
     def get_state(self) -> BTCGuardState:
         return self.state
 
     def get_deferred_summary(self) -> int:
-        """Сколько сигналов сейчас лежит в отложенных (для телеметрии/логов)."""
+        """Сколько сигналов сейчас лежит в отложенных (для телеметрии)."""
         return len(self._deferred)
+
+    def get_symbol_corr_state(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Возвращает (last_corr, prev_corr) для символа.
+        Можно использовать для диагностики / логов.
+        """
+        s = self._symbol_corr.get(symbol)
+        if not s:
+            return None, None
+        return s.last_corr, s.prev_corr
 
     # ─────────────────────────────────────────
     #         ВНУТРЕННЯЯ ЛОГИКА BTC
@@ -194,12 +274,16 @@ class BTCGuard:
 
         if prev_state != self.state:
             print(
-                f"[BTCGuard] STATE CHANGE {prev_state.value} → {self.state.value}; "
-                f"r5={r5}, r15={r15}, r30={r30}"
+                f"[BTCGuard][STATE] {prev_state.value} -> {self.state.value} | "
+                f"r5={r5:.2f if r5 is not None else 'None'}, "
+                f"r15={r15:.2f if r15 is not None else 'None'}, "
+                f"r30={r30:.2f if r30 is not None else 'None'}"
             )
 
     def _get_change_percent(self, minutes: int, now_ts: float) -> Optional[float]:
-        """% изменения цены BTC за N минут."""
+        """
+        % изменения цены BTC за N минут.
+        """
         if not self._btc_history:
             return None
 
@@ -251,8 +335,80 @@ class BTCGuard:
         if r5 is None or r15 is None:
             return False
 
-        calm_threshold = 0.5  # % — можно вынести в конфиг
+        calm_threshold = 0.5  # % — порог "спокойствия"
         return abs(r5) < calm_threshold and abs(r15) < calm_threshold
+
+    # ─────────────────────────────────────────
+    #       ОТСЛЕЖИВАНИЕ КОРРЕЛЯЦИИ ПО МОНЕТАМ
+    # ─────────────────────────────────────────
+
+    def _update_symbol_corr(
+        self,
+        symbol: str,
+        corr_now: float,
+        now_ts: float,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Обновляем историю корреляции по символу.
+        Возвращаем (prev_corr, delta_corr).
+        """
+        state = self._symbol_corr.get(symbol)
+        if state is None:
+            state = SymbolCorrState()
+            self._symbol_corr[symbol] = state
+
+        prev_corr = state.last_corr
+        state.prev_corr = prev_corr
+        state.last_corr = corr_now
+        state.last_update_ts = now_ts
+
+        delta_corr: Optional[float] = None
+        if prev_corr is not None:
+            delta_corr = corr_now - prev_corr
+
+        return prev_corr, delta_corr
+
+    # ─────────────────────────────────────────
+    #        ЛОГИКА БЛОКИРОВКИ ПО МОНЕТЕ
+    # ─────────────────────────────────────────
+
+    def _should_block_symbol(
+        self,
+        symbol: str,
+        corr_now: float,
+        prev_corr: Optional[float],
+        delta_corr: Optional[float],
+        liq_level: str,
+    ) -> Tuple[bool, str]:
+        """
+        Основная логика блокировки/разрешения по монете в ALERT.
+        Версия B + Liquidity Layer.
+        """
+        c = self.config
+        liq = liq_level.upper()
+
+        # 1) Низкая ликвидность → блок в ALERT
+        if liq in ("LOW", "ULTRA_LOW"):
+            return True, f"Low liquidity ({liq}) in ALERT"
+
+        # 2) Жёсткий порог по текущей корреляции
+        if corr_now >= c.corr_block_threshold:
+            return True, f"corr_now >= {c.corr_block_threshold:.2f}"
+
+        # 3) Монета была слабой, но поднялась до rebind_corr_threshold
+        if prev_corr is not None:
+            if prev_corr < c.weak_corr_max and corr_now >= c.rebind_corr_threshold:
+                return True, (
+                    f"prev_corr={prev_corr:.2f} < {c.weak_corr_max:.2f} "
+                    f"and corr_now={corr_now:.2f} >= {c.rebind_corr_threshold:.2f}"
+                )
+
+        # 4) Быстрый скачок корреляции
+        if delta_corr is not None and delta_corr >= c.delta_corr_block_threshold:
+            return True, f"delta_corr={delta_corr:.2f} >= {c.delta_corr_block_threshold:.2f}"
+
+        # Иначе — шорт по монете в ALERT разрешаем
+        return False, "allowed in ALERT (weak corr + sufficient liquidity)"
 
     # ─────────────────────────────────────────
     #         ОТЛОЖЕННЫЕ СИГНАЛЫ
@@ -265,6 +421,8 @@ class BTCGuard:
         signal_name: str,
         now_ts: float,
         ts_str: str,
+        btc_corr: float,
+        liq_level: str,
     ) -> None:
         self._deferred.append(
             DeferredItem(
@@ -273,11 +431,14 @@ class BTCGuard:
                 signal=signal_name,
                 created_at=now_ts,
                 raw_ts_str=ts_str,
+                btc_corr=btc_corr,
+                liq_level=liq_level,
+                btc_state=self.state.value,
             )
         )
 
     def _cleanup_deferred(self, now_ts: float) -> None:
-        ttl_sec = self.config.deferred_ttl_min * 60
+        ttl = float(self.config.deferred_ttl_sec)
         self._deferred = [
-            d for d in self._deferred if now_ts - d.created_at <= ttl_sec
+            d for d in self._deferred if now_ts - d.created_at <= ttl
         ]
