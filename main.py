@@ -8,6 +8,7 @@ import httpx
 
 # === NEW: BTC-Guard module ===
 from btc_guard.btc_guard import BTCGuard, BTCGuardConfig, BTCDecision, BTCGuardState
+from api_client import BinanceFuturesClient
 
 app = FastAPI()
 
@@ -21,6 +22,16 @@ CHAT_ID_TRADING = os.environ["TELEGRAM_CHAT_ID_TRADING"]
 
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 COOLDOWN = int(os.getenv("COOLDOWN_SECONDS", "10"))
+
+# === BINANCE FUTURES CLIENT ===
+
+try:
+    binance_client = BinanceFuturesClient(testnet=False)
+    print("[BINANCE] BinanceFuturesClient initialized successfully.")
+except Exception as e:
+    print(f"[BINANCE] WARNING: failed to initialize BinanceFuturesClient: {e}")
+    binance_client = None
+
 
 # === GLOBAL STATE ===
 
@@ -98,20 +109,54 @@ async def root():
 
 
 # =========================================================
-#           LIQUIDITY ENGINE (ЗАГЛУШКА)
+#           LIQUIDITY ENGINE (BINANCE ORDER BOOK)
 # =========================================================
 
 def _get_liquidity_level(symbol: str) -> str:
     """
-    ВРЕМЕННАЯ ЗАГЛУШКА.
-    Позже сюда подключим Liquidity Engine с Binance API.
+    Оценка ликвидности по Binance Futures через ордербук.
 
-    Сейчас:
-      - возвращаем "MEDIUM" для всех монет.
-      - логику BTCGuard по liq_level уже заложили: LOW/ULTRA_LOW будут блокироваться в ALERT.
+    Если Binance недоступен или произошла ошибка — возвращаем MEDIUM,
+    чтобы система работала как раньше и оставалась стабильной.
     """
-    # TODO: заменить на реальный уровень ликвидности после подключения Binance API
-    return "MEDIUM"
+    if binance_client is None:
+        return "MEDIUM"
+
+    try:
+        depth = binance_client.get_order_book(symbol=symbol, limit=50)
+        if not depth:
+            return "MEDIUM"
+
+        bids = depth.get("bids") or []
+        asks = depth.get("asks") or []
+
+        def _sum_notional(levels, n=10):
+            total = 0.0
+            for lvl in levels[:n]:
+                try:
+                    price = float(lvl[0])
+                    qty = float(lvl[1])
+                    total += price * qty
+                except Exception:
+                    continue
+            return total
+
+        notional_bids = _sum_notional(bids, n=10)
+        notional_asks = _sum_notional(asks, n=10)
+        total = notional_bids + notional_asks
+
+        # Классификация ликвидности
+        if total >= 20_000_000:
+            return "HIGH"
+        if total >= 5_000_000:
+            return "MEDIUM"
+        if total >= 1_000_000:
+            return "LOW"
+        return "ULTRA_LOW"
+
+    except Exception as e:
+        print(f"[LIQUIDITY] ERROR for {symbol}: {e}")
+        return "MEDIUM"
 
 
 # =========================================================
@@ -735,7 +780,7 @@ async def tv_webhook_v0(request: Request):
         return {"status": "cooldown_skip"}
     _last_by_key[key] = now_ts
 
-    # 3) Liquidity level (пока через заглушку)
+    # 3) Liquidity level (Binance Order Book)
     liq_level = _get_liquidity_level(symbol)
 
     # 4) BTCGuard по монете — решаем, пускать ли сигнал в AntiFOMO
