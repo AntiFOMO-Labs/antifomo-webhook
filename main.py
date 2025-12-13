@@ -14,6 +14,14 @@ import httpx
 from btc_guard.btc_guard import BTCGuard, BTCGuardConfig, BTCDecision, BTCGuardState
 from api_client import BinanceFuturesClient
 
+# === CorrEngine v1 (file-based) ===
+# Safe import: if corr_reader.py missing/broken, AntiFOMO will not crash.
+try:
+    from corr_reader import get_decision as corr_get_decision, get_status as corr_get_status
+except Exception:
+    corr_get_decision = None
+    corr_get_status = None
+
 # -------------------------------------------------
 #            LOGGING CONFIG
 # -------------------------------------------------
@@ -946,6 +954,30 @@ async def tv_webhook_v0(request: Request):
         return {"status": "cooldown_skip"}
     _last_by_key[key] = now_ts
 
+    # --- CorrEngine v1 gate (file-based) ---
+# CorrEngine пишет /root/antifomo/cache/corr_state.json
+# decision_hint: ALLOW / DEFER / ALERT
+if corr_get_decision is not None and corr_get_status is not None:
+    corr_decision = corr_get_decision(symbol, default="DEFER")  # safe default: DEFER
+    corr_status = corr_get_status(symbol, default="NO_DATA")
+
+    if corr_decision != "ALLOW":
+        HB_COUNTER["defer"] += 1
+        logger.info(
+            "[CorrEngine] DEFER symbol=%s signal=%s decision=%s status=%s",
+            symbol, signal, corr_decision, corr_status
+        )
+        return {
+            "status": "deferred_corr",
+            "symbol": symbol,
+            "signal": signal,
+            "corr_decision": corr_decision,
+            "corr_status": corr_status,
+        }
+else:
+    logger.warning("[CorrEngine] corr_reader not available; skipping corr gate (ALLOW by default)")
+
+    
     liq_level = _get_liquidity_level(symbol)
 
     try:
