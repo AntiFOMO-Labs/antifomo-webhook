@@ -955,29 +955,28 @@ async def tv_webhook_v0(request: Request):
     _last_by_key[key] = now_ts
 
     # --- CorrEngine v1 gate (file-based) ---
-# CorrEngine пишет /root/antifomo/cache/corr_state.json
-# decision_hint: ALLOW / DEFER / ALERT
-if corr_get_decision is not None and corr_get_status is not None:
-    corr_decision = corr_get_decision(symbol, default="DEFER")  # safe default: DEFER
-    corr_status = corr_get_status(symbol, default="NO_DATA")
+    # CorrEngine пишет /root/antifomo/cache/corr_state.json
+    # decision_hint: ALLOW / DEFER / ALERT
+    if corr_get_decision is not None and corr_get_status is not None:
+        corr_decision = corr_get_decision(symbol, default="DEFER")  # safe default: DEFER
+        corr_status = corr_get_status(symbol, default="NO_DATA")
 
-    if corr_decision != "ALLOW":
-        HB_COUNTER["defer"] += 1
-        logger.info(
-            "[CorrEngine] DEFER symbol=%s signal=%s decision=%s status=%s",
-            symbol, signal, corr_decision, corr_status
-        )
-        return {
-            "status": "deferred_corr",
-            "symbol": symbol,
-            "signal": signal,
-            "corr_decision": corr_decision,
-            "corr_status": corr_status,
-        }
-else:
-    logger.warning("[CorrEngine] corr_reader not available; skipping corr gate (ALLOW by default)")
+        if corr_decision != "ALLOW":
+            HB_COUNTER["defer"] += 1
+            logger.info(
+                "[CorrEngine] DEFER symbol=%s signal=%s decision=%s status=%s",
+                symbol, signal, corr_decision, corr_status
+            )
+            return {
+                "status": "deferred_corr",
+                "symbol": symbol,
+                "signal": signal,
+                "corr_decision": corr_decision,
+                "corr_status": corr_status,
+            }
+    else:
+        logger.warning("[CorrEngine] corr_reader not available; skipping corr gate (ALLOW by default)")
 
-    
     liq_level = _get_liquidity_level(symbol)
 
     try:
@@ -994,6 +993,7 @@ else:
         ts_str=ts_str,
         signal_name=signal,
     )
+
 
     if decision == BTCDecision.DEFER:
         HB_COUNTER["defer"] += 1
