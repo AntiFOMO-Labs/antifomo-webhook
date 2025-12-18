@@ -77,13 +77,6 @@ tg_client: httpx.AsyncClient | None = None
 binance_client: BinanceFuturesClient | None = None
 
 
-# -------------------------------------------------
-#                HEARTBEAT CONFIG
-# -------------------------------------------------
-
-APP_START_TS = time.time()
-HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", "600"))  # 10 минут
-
 
 # -------------------------------------------------
 #               HELPERS (GENERAL)
@@ -144,71 +137,6 @@ async def send_telegram(chat_id: str, text: str, disable_preview: bool = True):
         logger.warning(f"[TELEGRAM HTTP ERROR] status={status}, detail={e}")
     except Exception as e:
         logger.warning(f"[TELEGRAM EXCEPTION] {e}")
-
-
-# -------------------------------------------------
-#                  HEARTBEAT LOOP
-# -------------------------------------------------
-
-HB_COUNTER = {
-    "alerts": 0,
-    "btc_ticks": 0,
-    "allow": 0,
-    "defer": 0,
-}
-
-async def heartbeat_loop() -> None:
-    await asyncio.sleep(10)  # дать сервису подняться
-
-    prev_stats = None
-
-    while True:
-        try:
-            uptime_min = int((time.time() - APP_START_TS) / 60)
-            btc_state = btc_guard.get_state().value
-
-            stats = None
-            if binance_client is not None and hasattr(binance_client, "get_orderbook_stats"):
-                try:
-                    stats = binance_client.get_orderbook_stats()
-                except Exception:
-                    stats = None
-
-            line1 = f"🟢 AntiFOMO heartbeat | uptime {uptime_min}m | BTCGuard={btc_state}"
-            line2 = f"Signals: alerts={HB_COUNTER['alerts']} allow={HB_COUNTER['allow']} defer={HB_COUNTER['defer']} btc_ticks={HB_COUNTER['btc_ticks']}"
-
-            if stats:
-                ob_line = (
-                    f"OrderBook: ok={stats.get('ok')} cached={stats.get('cached')} stale={stats.get('stale')} "
-                    f"blocked={stats.get('blocked')} errors={stats.get('errors')} cache={stats.get('cache_size')}"
-                )
-
-                # Дельта за период (не обязательно, но удобно)
-                delta_line = ""
-                if isinstance(prev_stats, dict):
-                    try:
-                        delta_line = (
-                            f"Δ10m: ok+{stats.get('ok',0)-prev_stats.get('ok',0)} "
-                            f"cached+{stats.get('cached',0)-prev_stats.get('cached',0)} "
-                            f"stale+{stats.get('stale',0)-prev_stats.get('stale',0)} "
-                            f"blocked+{stats.get('blocked',0)-prev_stats.get('blocked',0)}"
-                        )
-                    except Exception:
-                        delta_line = ""
-
-                prev_stats = stats
-
-                msg = "\n".join([line1, line2, ob_line] + ([delta_line] if delta_line else []))
-            else:
-                msg = "\n".join([line1, line2, "OrderBook: stats unavailable"])
-
-            await send_telegram(CHAT_ID_TRADING, msg)
-
-        except Exception as e:
-            logger.warning(f"[HEARTBEAT] error: {e}")
-
-        await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
-
 
 # -------------------------------------------------
 #                 STARTUP / SHUTDOWN
